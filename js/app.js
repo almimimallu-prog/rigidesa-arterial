@@ -2,6 +2,7 @@
 import { analyzePpg, median } from './dsp.js';
 import { estimateVascularAge, validateInputs } from './model.js';
 import { describeDiagnostics, formatReport } from './diagnostics.js';
+import { liveQuality, targetExposureTime } from './live-quality.js';
 
 const SETTLE_SECONDS = 8; // lets auto-exposure stabilise before recording
 const RECORD_SECONDS = 60;
@@ -11,6 +12,7 @@ const FINGER_RED_TO_GREEN = 1.5;
 const FINGER_LOST_SECONDS = 0.3; // longer gaps would be interpolated into fake beats
 const SATURATION_LEVEL = 250;
 const PLOT_SECONDS = 5;
+const LIVE_QUALITY_SAMPLES = 240; // > 3 s even at 60 fps
 const HISTORY_KEY = 'rigidesa.history';
 const PROFILE_KEY = 'rigidesa.profile';
 const HISTORY_LIMIT = 100;
@@ -172,7 +174,36 @@ async function openCamera() {
   } catch {
     // No torch control (e.g. iOS Safari): the user needs strong ambient light.
   }
-  return { stream, torch };
+  return { stream, torch, track };
+}
+
+/**
+ * Freezes exposure and white balance at their current (settled) values so the
+ * camera's auto-exposure does not fight the pulse. Best effort: browsers
+ * without manual controls keep auto mode. Returns whether anything was locked.
+ */
+async function lockExposure(track, meanRed) {
+  if (!track || !track.getCapabilities) return false;
+  const capabilities = track.getCapabilities();
+  const settings = track.getSettings();
+  const advanced = {};
+  const canManual = (name) => Array.isArray(capabilities[name]) && capabilities[name].includes('manual');
+  if (canManual('exposureMode') && Number.isFinite(settings.exposureTime)) {
+    advanced.exposureMode = 'manual';
+    // Near clipping: lower the exposure (the torch power itself is not adjustable).
+    advanced.exposureTime = targetExposureTime(settings.exposureTime, meanRed, capabilities.exposureTime);
+  }
+  if (canManual('whiteBalanceMode') && Number.isFinite(settings.colorTemperature)) {
+    advanced.whiteBalanceMode = 'manual';
+    advanced.colorTemperature = settings.colorTemperature;
+  }
+  if (Object.keys(advanced).length === 0) return false;
+  try {
+    await track.applyConstraints({ advanced: [advanced] });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function frameColour(context, video) {
@@ -231,10 +262,15 @@ function handleFrame(session, time, colour) {
     status.textContent = `Dit detectat. Estabilitzant… ${Math.ceil(SETTLE_SECONDS - elapsed)} s`;
     return false;
   }
+  if (!session.exposureTried) {
+    session.exposureTried = true;
+    lockExposure(session.track, colour.red).then((locked) => { session.exposureLocked = locked; });
+  }
   session.samples.push({ t: time, red: colour.red, green: colour.green });
   const recorded = elapsed - SETTLE_SECONDS;
   $('measure-progress').value = Math.min(1, recorded / RECORD_SECONDS);
-  status.textContent = `Mesurant… ${Math.max(0, Math.ceil(RECORD_SECONDS - recorded))} s. No et moguis.`;
+  const hint = liveQuality(session.samples.slice(-LIVE_QUALITY_SAMPLES)).message;
+  status.textContent = `Mesurant… ${Math.max(0, Math.ceil(RECORD_SECONDS - recorded))} s. ${hint}`;
   drawWave(session.samples);
   return recorded >= RECORD_SECONDS;
 }
@@ -270,23 +306,24 @@ async function startMeasurement(input) {
   const session = {
     stream: null, torch: false, active: true, samples: [], lastTime: -Infinity,
     fingerSince: null, lostSince: null, lastMediaTime: -Infinity, useCallbackClock: false,
-    fingerResets: 0,
+    fingerResets: 0, track: null, exposureTried: false, exposureLocked: false,
   };
   capture = session;
   try {
     await acquireWakeLock();
     if (!session.active) { releaseWakeLock(); return; } // cancelled meanwhile
-    const { stream, torch } = await openCamera();
+    const { stream, torch, track } = await openCamera();
     if (!session.active) { stopStream(stream); return; } // cancelled during the prompt
     session.stream = stream;
     session.torch = torch;
+    session.track = track;
     const video = $('video');
     video.srcObject = stream;
     await video.play();
     if (!session.active) return;
     runFrameLoop(session, video, (samples) => {
       // Read before stopCapture() releases the wake lock.
-      const setup = { torch: session.torch, wakeLock: wakeLock !== null, fingerResets: session.fingerResets };
+      const setup = { torch: session.torch, wakeLock: wakeLock !== null, fingerResets: session.fingerResets, exposureLocked: session.exposureLocked };
       stopCapture();
       finishMeasurement(input, samples, setup);
     });

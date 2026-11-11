@@ -69,6 +69,9 @@ function contextRows(context) {
   if (typeof context.wakeLock === 'boolean') {
     rows.push(row('Pantalla encesa', context.wakeLock ? 'sí' : 'no garantida', context.wakeLock ? 'ok' : 'warn'));
   }
+  if (typeof context.exposureLocked === 'boolean') {
+    rows.push(row('Exposició bloquejada', context.exposureLocked ? 'sí' : 'no (automàtica)', context.exposureLocked ? 'ok' : 'warn'));
+  }
   if (has(context.fingerResets)) {
     rows.push(row('Dit aixecat', context.fingerResets === 0 ? 'cap vegada' : `${context.fingerResets} vegades`,
       context.fingerResets === 0 ? 'ok' : 'warn'));
