@@ -152,8 +152,10 @@ function meanOf(segments) {
   return out;
 }
 
-function emptyTemplate(beatsDetected, medianIbi) {
-  return { template: null, beatsUsed: 0, beatsDetected, medianIbi, meanCorrelation: 0, fiducialIndex: 0 };
+function emptyTemplate(beatsDetected, medianIbi, beatsRegular = 0) {
+  return {
+    template: null, beatsUsed: 0, beatsDetected, beatsRegular, medianIbi, meanCorrelation: 0, fiducialIndex: 0,
+  };
 }
 
 /** Beats whose neighbouring intervals are close to the median (drops ectopics/misses). */
@@ -193,21 +195,23 @@ export function buildTemplate(signal, beats, fs = TARGET_FS) {
   const post = Math.round(Math.min(TEMPLATE_MAX_POST_S, medianIbi - TEMPLATE_PRE_S) * fs);
   if (!(post > 0)) return emptyTemplate(beats.length, medianIbi);
 
-  const segments = regularBeats(beats, intervals, medianIbi)
+  const regular = regularBeats(beats, intervals, medianIbi);
+  const segments = regular
     .map((beat) => normalisedSegment(signal, beat, pre, pre + post))
     .filter((segment) => segment !== null);
-  if (segments.length === 0) return emptyTemplate(beats.length, medianIbi);
+  if (segments.length === 0) return emptyTemplate(beats.length, medianIbi, regular.length);
 
   const draft = meanOf(segments);
   const kept = segments
     .map((segment) => ({ segment, r: correlation(segment, draft) }))
     .filter((scored) => scored.r >= MIN_BEAT_CORRELATION);
-  if (kept.length === 0) return emptyTemplate(beats.length, medianIbi);
+  if (kept.length === 0) return emptyTemplate(beats.length, medianIbi, regular.length);
 
   return {
     template: meanOf(kept.map((scored) => scored.segment)),
     beatsUsed: kept.length,
     beatsDetected: beats.length,
+    beatsRegular: regular.length,
     medianIbi,
     meanCorrelation: kept.reduce((sum, scored) => sum + scored.r, 0) / kept.length,
     fiducialIndex: pre,
@@ -258,14 +262,37 @@ function lateSystolicWaves(d2, bIndex, eIndex, fs) {
 const DELTA_T_RANGE_S = [0.1, 0.5];
 const REFLECTION_INDEX_RANGE = [0.1, 1.0];
 
+// Written as a negated "inside" test so NaN counts as outside.
+const outside = (x, [low, high]) => !(x >= low && x <= high);
+
+/** Why a feature set was rejected (Catalan: shown in the diagnostic panel), or null. */
+function implausibilityReason(deltaT, reflectionIndex) {
+  if (outside(deltaT, DELTA_T_RANGE_S)) {
+    return `ΔT fora de rang (${Math.round(deltaT * 1000)} ms; s'espera 100–500 ms).`;
+  }
+  if (outside(reflectionIndex, REFLECTION_INDEX_RANGE)) {
+    return `Índex de reflexió fora de rang (${Math.round(reflectionIndex * 100)} %; s'espera 10–100 %).`;
+  }
+  return null;
+}
+
+/** Diastolic peak: first maximum after the notch; else the inflection point. */
+function diastolicLandmark(template, d1, eIndex, fs) {
+  const to = Math.min(template.length - 2, eIndex + Math.round(0.25 * fs));
+  const peak = localExtrema(template, eIndex, to).find((x) => x.kind === 'max');
+  return { index: peak ? peak.index : argExtreme(d1, eIndex, to, 1), separate: Boolean(peak) };
+}
+
+const featureFailure = (failure) => ({ features: null, failure });
+
 /**
- * Morphology features from the averaged pulse:
+ * Morphology features from the averaged pulse, plus the reason when they
+ * cannot be trusted ({ features, failure }; exactly one of them is null):
  *  - deltaT: systolic peak → diastolic peak/inflection (s). SI = height / deltaT.
  *  - agingIndex: (b − c − d − e) / a on the second derivative (Takazawa 1998).
- *  - reflectionIndex, crestTime.
- * Returns null when landmarks cannot be located.
+ *  - reflectionIndex, crestTime, marks (template sample indices of the landmarks).
  */
-export function extractFeatures(template, fiducialIndex, fs = TARGET_FS) {
+export function analyseFeatures(template, fiducialIndex, fs = TARGET_FS) {
   const d1 = derivative(template, fs);
   const d2 = smooth3(derivative(d1, fs));
   const footIndex = argExtreme(template, 0, fiducialIndex, -1);
@@ -275,38 +302,42 @@ export function extractFeatures(template, fiducialIndex, fs = TARGET_FS) {
   // e wave (dicrotic notch) = most prominent positive wave after the systolic peak.
   const eFrom = systolicIndex + Math.round(0.03 * fs);
   const eTo = Math.min(template.length - 2, systolicIndex + Math.round(0.35 * fs));
-  if (d2[aIndex] <= 0 || eFrom >= eTo) return null;
+  if (d2[aIndex] <= 0 || eFrom >= eTo) return featureFailure('No es localitza la pujada sistòlica (ona a).');
   const lateMaxima = localExtrema(d2, eFrom, eTo).filter((x) => x.kind === 'max');
-  if (lateMaxima.length === 0) return null;
+  if (lateMaxima.length === 0) return featureFailure('No es troba l\'osca dicrota (ona e).');
   const eIndex = lateMaxima.reduce((best, x) => (d2[x.index] > d2[best.index] ? x : best)).index;
   const bIndex = argExtreme(d2, aIndex, Math.min(eIndex - 3, aIndex + Math.round(0.2 * fs)), -1);
-  if (eIndex - bIndex < 4) return null;
+  if (eIndex - bIndex < 4) return featureFailure('Les ones b i e són massa properes per separar-les.');
 
   const a = d2[aIndex];
   const late = lateSystolicWaves(d2, bIndex, eIndex, fs);
   const agingIndex = (d2[bIndex] - late.c - late.d - d2[eIndex]) / a;
 
-  // Diastolic peak: first maximum after the notch; else the inflection point
-  // (slope closest to zero while still descending).
-  const diastolicTo = Math.min(template.length - 2, eIndex + Math.round(0.25 * fs));
-  const peak = localExtrema(template, eIndex, diastolicTo).find((x) => x.kind === 'max');
-  const diastolicIndex = peak ? peak.index : argExtreme(d1, eIndex, diastolicTo, 1);
-  const deltaT = (diastolicIndex - systolicIndex) / fs;
+  const diastolic = diastolicLandmark(template, d1, eIndex, fs);
+  const deltaT = (diastolic.index - systolicIndex) / fs;
   const amplitude = template[systolicIndex] - template[footIndex];
-  if (amplitude <= 0) return null;
-  const reflectionIndex = (template[diastolicIndex] - template[footIndex]) / amplitude;
-  const plausible = deltaT >= DELTA_T_RANGE_S[0] && deltaT <= DELTA_T_RANGE_S[1]
-    && reflectionIndex >= REFLECTION_INDEX_RANGE[0] && reflectionIndex <= REFLECTION_INDEX_RANGE[1];
-  if (!plausible) return null;
+  if (amplitude <= 0) return featureFailure('Amplitud del pols nul·la.');
+  const reflectionIndex = (template[diastolic.index] - template[footIndex]) / amplitude;
+  const reason = implausibilityReason(deltaT, reflectionIndex);
+  if (reason) return featureFailure(reason);
 
   return {
-    deltaT,
-    agingIndex,
-    reflectionIndex,
-    crestTime: (systolicIndex - footIndex) / fs,
-    waves: { bOverA: d2[bIndex] / a, cOverA: late.c / a, dOverA: late.d / a, eOverA: d2[eIndex] / a },
-    separateDiastolicPeak: Boolean(peak),
+    failure: null,
+    features: {
+      deltaT,
+      agingIndex,
+      reflectionIndex,
+      crestTime: (systolicIndex - footIndex) / fs,
+      waves: { bOverA: d2[bIndex] / a, cOverA: late.c / a, dOverA: late.d / a, eOverA: d2[eIndex] / a },
+      separateDiastolicPeak: diastolic.separate,
+      marks: { foot: footIndex, systolic: systolicIndex, notch: eIndex, diastolic: diastolic.index },
+    },
   };
+}
+
+/** Features only (null when landmarks cannot be located). */
+export function extractFeatures(template, fiducialIndex, fs = TARGET_FS) {
+  return analyseFeatures(template, fiducialIndex, fs).features;
 }
 
 function clamp01(x) { return Math.min(1, Math.max(0, x)); }
@@ -316,34 +347,88 @@ function clamp01(x) { return Math.min(1, Math.max(0, x)); }
  * @param {number[]} times  seconds, increasing
  * @param {number[]} brightness  mean channel intensity per frame
  */
+const mean = (values) => values.reduce((sum, v) => sum + v, 0) / values.length;
+
+function stdDev(values) {
+  const centre = mean(values);
+  return Math.sqrt(mean(Array.from(values, (v) => (v - centre) ** 2)));
+}
+
+/** Frame timing and pulsatility (band-passed RMS relative to the mean level, in %). */
+function signalStats(times, brightness, filtered) {
+  const durationS = times[times.length - 1] - times[0];
+  const level = mean(brightness);
+  return {
+    frames: times.length,
+    durationS,
+    frameRate: (times.length - 1) / durationS,
+    meanLevel: level,
+    pulsatilityPercent: level > 0 ? (100 * stdDev(filtered)) / level : 0,
+  };
+}
+
+function beatStats(beats, fs) {
+  const intervals = [];
+  for (let i = 1; i < beats.length; i++) intervals.push((beats[i] - beats[i - 1]) / fs);
+  const average = intervals.length > 0 ? mean(intervals) : 0;
+  return {
+    beatsDetected: beats.length,
+    medianIbi: intervals.length > 0 ? median(intervals) : 0,
+    ibiCv: average > 0 ? stdDev(intervals) / average : 0,
+  };
+}
+
+const rejected = (reason, diagnostics) => ({ ok: false, reason, diagnostics });
+
+/** The three factors whose product is the quality score (each 0–1). */
+function qualityFactors(built) {
+  return {
+    beatsKept: clamp01(built.beatsUsed / built.beatsDetected),
+    correlation: clamp01((built.meanCorrelation - MIN_BEAT_CORRELATION) / 0.07),
+    beatCount: clamp01(built.beatsUsed / TARGET_BEATS),
+  };
+}
+
 export function analyzePpg(times, brightness) {
   if (!Array.isArray(times) || !Array.isArray(brightness)
     || times.length !== brightness.length || times.length < 100) {
-    return { ok: false, reason: 'Senyal massa curt.' };
+    const frames = Array.isArray(times) ? times.length : 0;
+    return rejected('Senyal massa curt.', { frames, failedStage: 'dades de la càmera' });
   }
   const fs = TARGET_FS;
   // Blood absorbs light: more volume = darker frame, so invert.
   const inverted = brightness.map((v) => -v);
   const filtered = bandpass(resampleUniform(times, inverted, fs), fs);
   const beats = detectBeats(filtered, fs);
+  const signal = { ...signalStats(times, brightness, filtered), ...beatStats(beats, fs) };
   if (beats.length < MIN_BEATS) {
-    return { ok: false, reason: 'No s\'han detectat prou batecs. Repeteix amb el dit quiet.' };
+    return rejected('No s\'han detectat prou batecs. Repeteix amb el dit quiet.',
+      { ...signal, failedStage: 'detecció de batecs' });
   }
   const built = buildTemplate(filtered, beats, fs);
+  const stats = {
+    ...signal, beatsRegular: built.beatsRegular, beatsUsed: built.beatsUsed, meanCorrelation: built.meanCorrelation,
+  };
   if (!built.template || built.beatsUsed < MIN_BEATS) {
-    return { ok: false, reason: 'Senyal massa irregular. Repeteix sense moure el dit ni prémer fort.' };
+    return rejected('Senyal massa irregular. Repeteix sense moure el dit ni prémer fort.',
+      { ...stats, failedStage: 'plantilla del pols' });
   }
-  const quality = clamp01(built.beatsUsed / built.beatsDetected)
-    * clamp01((built.meanCorrelation - MIN_BEAT_CORRELATION) / 0.07)
-    * clamp01(built.beatsUsed / TARGET_BEATS);
+  const factors = qualityFactors(built);
+  const analysis = analyseFeatures(built.template, built.fiducialIndex, fs);
   return {
     ok: true,
     heartRate: 60 / built.medianIbi,
     beatsUsed: built.beatsUsed,
     beatsDetected: built.beatsDetected,
-    quality,
-    features: extractFeatures(built.template, built.fiducialIndex, fs),
+    quality: factors.beatsKept * factors.correlation * factors.beatCount,
+    features: analysis.features,
     template: Array.from(built.template),
-    frameRate: (times.length - 1) / (times[times.length - 1] - times[0]),
+    frameRate: signal.frameRate,
+    diagnostics: {
+      ...stats,
+      qualityFactors: factors,
+      featureFailure: analysis.failure,
+      marks: analysis.features ? analysis.features.marks : null,
+    },
   };
 }

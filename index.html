@@ -74,6 +74,17 @@
       <button type="button" id="edit-data" class="secondary">Canvia les dades</button>
     </section>
 
+    <details class="card" id="diagnostics" hidden>
+      <summary>Diagnòstic de la mesura</summary>
+      <p class="muted" id="diag-summary"></p>
+      <ul class="diag" id="diag-rows"></ul>
+      <canvas id="diag-pulse" width="640" height="200" aria-label="Pols mitjà reconstruït" hidden></canvas>
+      <p class="muted" id="diag-pulse-note" hidden>
+        Pols mitjà dels batecs vàlids. Línies: sístole (vermell), osca dicrota (groc), diàstole (verd).
+      </p>
+      <button type="button" id="copy-diagnostics" class="secondary">Copia el diagnòstic</button>
+    </details>
+
     <section class="card" id="history-card" hidden>
       <h2>Historial</h2>
       <p id="history-summary" class="status"></p>

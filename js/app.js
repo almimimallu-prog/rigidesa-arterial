@@ -1,6 +1,7 @@
 // Browser glue: form, camera capture, rendering, local history.
 import { analyzePpg, median } from './dsp.js';
 import { estimateVascularAge, validateInputs } from './model.js';
+import { describeDiagnostics, formatReport } from './diagnostics.js';
 
 const SETTLE_SECONDS = 8; // lets auto-exposure stabilise before recording
 const RECORD_SECONDS = 60;
@@ -26,6 +27,7 @@ const FRAGMENT_KEYS = { age: 'age', h: 'heightCm', sys: 'systolic', dia: 'diasto
 
 let capture = null; // active camera session, or null
 let wakeLock = null; // screen wake lock held while measuring, or null
+let lastReport = null; // copyable diagnostic text of the latest measurement
 
 function showStep(name) {
   for (const [key, element] of Object.entries(steps)) element.hidden = key !== name;
@@ -214,6 +216,7 @@ function handleFrame(session, time, colour) {
     if (time - session.lostSince > FINGER_LOST_SECONDS) {
       session.samples = [];
       session.fingerSince = null;
+      session.fingerResets += 1;
       $('measure-progress').value = 0;
       status.textContent = session.torch
         ? 'Tapa la càmera i el flaix amb el dit.'
@@ -260,12 +263,14 @@ function runFrameLoop(session, video, onComplete) {
 async function startMeasurement(input) {
   if (capture) return;
   showStep('measure');
+  $('diagnostics').hidden = true; // belongs to the previous measurement
   $('measure-progress').value = 0;
   $('measure-status').textContent = 'Preparant la càmera…';
   // Registered before the first await so Cancel can reach it at any moment.
   const session = {
     stream: null, torch: false, active: true, samples: [], lastTime: -Infinity,
     fingerSince: null, lostSince: null, lastMediaTime: -Infinity, useCallbackClock: false,
+    fingerResets: 0,
   };
   capture = session;
   try {
@@ -280,8 +285,10 @@ async function startMeasurement(input) {
     await video.play();
     if (!session.active) return;
     runFrameLoop(session, video, (samples) => {
+      // Read before stopCapture() releases the wake lock.
+      const setup = { torch: session.torch, wakeLock: wakeLock !== null, fingerResets: session.fingerResets };
       stopCapture();
-      finishMeasurement(input, samples);
+      finishMeasurement(input, samples, setup);
     });
   } catch (error) {
     const cancelled = !session.active;
@@ -297,11 +304,84 @@ async function startMeasurement(input) {
   }
 }
 
-function finishMeasurement(input, samples) {
+// ---------- diagnostic panel ----------
+
+const STATUS_MARK = { ok: '✓', warn: '!', bad: '✗' };
+const PULSE_MARK_COLOURS = { systolic: '#ff5d5d', notch: '#f5b942', diastolic: '#3ecf8e' };
+
+function drawPulse(template, marks) {
+  const canvas = $('diag-pulse');
+  const visible = Array.isArray(template) && template.length > 2;
+  canvas.hidden = !visible;
+  $('diag-pulse-note').hidden = !visible;
+  if (!visible) return;
+  const context = canvas.getContext('2d');
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  const low = Math.min(...template), high = Math.max(...template);
+  if (high <= low) return;
+  const xOf = (index) => (index / (template.length - 1)) * canvas.width;
+  context.lineWidth = 2;
+  for (const [name, colour] of Object.entries(PULSE_MARK_COLOURS)) {
+    if (!marks || !Number.isFinite(marks[name])) continue;
+    context.strokeStyle = colour;
+    context.beginPath();
+    context.moveTo(xOf(marks[name]), 0);
+    context.lineTo(xOf(marks[name]), canvas.height);
+    context.stroke();
+  }
+  context.strokeStyle = '#eef3f7';
+  context.lineWidth = 3;
+  context.beginPath();
+  template.forEach((value, index) => {
+    const y = canvas.height - 10 - ((value - low) / (high - low)) * (canvas.height - 20);
+    if (index === 0) context.moveTo(xOf(index), y); else context.lineTo(xOf(index), y);
+  });
+  context.stroke();
+}
+
+function diagnosticRow({ label, value, status }) {
+  const item = document.createElement('li');
+  const name = document.createElement('span');
+  const detail = document.createElement('span');
+  name.textContent = `${STATUS_MARK[status]} ${label}`;
+  detail.textContent = value;
+  detail.className = status;
+  item.append(name, detail);
+  return item;
+}
+
+function showDiagnostics(ppg, setup) {
+  const rows = describeDiagnostics(ppg.diagnostics, setup);
+  $('diag-rows').replaceChildren(...rows.map(diagnosticRow));
+  const problems = rows.filter((row) => row.status !== 'ok').length;
+  $('diag-summary').textContent = problems === 0
+    ? 'Cap problema detectat. Els llindars són orientatius, no validats.'
+    : `${problems} punt(s) a revisar. Els llindars són orientatius, no validats.`;
+  drawPulse(ppg.template, ppg.diagnostics ? ppg.diagnostics.marks : null);
+  lastReport = formatReport(ppg.diagnostics, setup, ppg.template);
+  const panel = $('diagnostics');
+  panel.hidden = false;
+  panel.open = rows.some((row) => row.status === 'bad');
+}
+
+async function copyDiagnostics() {
+  if (!lastReport) return;
+  const button = $('copy-diagnostics');
+  try {
+    await navigator.clipboard.writeText(lastReport);
+    button.textContent = 'Copiat ✓';
+  } catch {
+    button.textContent = 'No s\'ha pogut copiar';
+  }
+  setTimeout(() => { button.textContent = 'Copia el diagnòstic'; }, 2000);
+}
+
+function finishMeasurement(input, samples, setup) {
   const times = samples.map((s) => s.t);
   const redSaturated = median(samples.map((s) => s.red)) >= SATURATION_LEVEL;
   const channel = samples.map((s) => (redSaturated ? s.green : s.red));
   const ppg = analyzePpg(times, channel);
+  showDiagnostics(ppg, { ...setup, channel: redSaturated ? 'verd' : 'vermell', redSaturated });
   if (!ppg.ok) {
     showStep('form');
     const errorBox = $('form-error');
@@ -430,8 +510,11 @@ function init() {
   });
   $('skip-camera').addEventListener('click', () => {
     const input = validatedForm();
-    if (input) showResult(input, null);
+    if (!input) return;
+    $('diagnostics').hidden = true; // no camera measurement to diagnose
+    showResult(input, null);
   });
+  $('copy-diagnostics').addEventListener('click', copyDiagnostics);
   $('cancel-measure').addEventListener('click', () => { stopCapture(); showStep('form'); });
   $('repeat').addEventListener('click', () => {
     const input = validatedForm();
