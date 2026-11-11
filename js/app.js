@@ -25,6 +25,7 @@ const FIELDS = {
 const FRAGMENT_KEYS = { age: 'age', h: 'heightCm', sys: 'systolic', dia: 'diastolic', hr: 'restingHr', rmssd: 'rmssd' };
 
 let capture = null; // active camera session, or null
+let wakeLock = null; // screen wake lock held while measuring, or null
 
 function showStep(name) {
   for (const [key, element] of Object.entries(steps)) element.hidden = key !== name;
@@ -97,7 +98,30 @@ function stopStream(stream) {
   if (stream) stream.getTracks().forEach((track) => track.stop());
 }
 
+/**
+ * Keeps the screen on so the phone does not lock mid-measurement.
+ * Best effort: unsupported browsers (or a denied request) just measure
+ * without it. The browser drops the lock itself if the page is hidden,
+ * which already aborts the measurement (see visibilitychange).
+ */
+async function acquireWakeLock() {
+  if (wakeLock || !('wakeLock' in navigator)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = null; });
+  } catch {
+    wakeLock = null;
+  }
+}
+
+function releaseWakeLock() {
+  const lock = wakeLock;
+  wakeLock = null;
+  if (lock) lock.release().catch(() => {});
+}
+
 function stopCapture() {
+  releaseWakeLock();
   if (!capture) return;
   capture.active = false;
   stopStream(capture.stream); // null while the permission prompt is still open
@@ -245,6 +269,8 @@ async function startMeasurement(input) {
   };
   capture = session;
   try {
+    await acquireWakeLock();
+    if (!session.active) { releaseWakeLock(); return; } // cancelled meanwhile
     const { stream, torch } = await openCamera();
     if (!session.active) { stopStream(stream); return; } // cancelled during the prompt
     session.stream = stream;
