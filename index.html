@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="ca">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0f1720">
+  <title>Rigidesa arterial</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Rigidesa arterial</h1>
+      <p class="muted">Edat vascular estimada · Forerunner 570 + càmera del mòbil</p>
+    </header>
+
+    <section id="step-form" class="card">
+      <h2>1 · Dades</h2>
+      <p id="watch-banner" class="banner" hidden>Dades rebudes del rellotge.</p>
+      <form id="profile-form" novalidate>
+        <label>Edat (anys)
+          <input id="age" type="number" inputmode="numeric" min="18" max="95" required>
+        </label>
+        <label>Alçada (cm)
+          <input id="height" type="number" inputmode="numeric" min="130" max="220" required>
+        </label>
+        <label>Pressió sistòlica (mmHg) <span class="muted">opcional, recomanat</span>
+          <input id="systolic" type="number" inputmode="numeric" min="70" max="250">
+        </label>
+        <label>Pressió diastòlica (mmHg)
+          <input id="diastolic" type="number" inputmode="numeric" min="40" max="150">
+        </label>
+        <label>FC en repòs del rellotge (bpm) <span class="muted">opcional</span>
+          <input id="resting-hr" type="number" inputmode="numeric" min="30" max="130">
+        </label>
+        <label>RMSSD del rellotge (ms) <span class="muted">opcional</span>
+          <input id="rmssd" type="number" inputmode="numeric" min="1" max="300">
+        </label>
+        <p id="form-error" class="error" role="alert" hidden></p>
+        <button type="submit" class="primary">Mesura amb la càmera</button>
+        <button type="button" id="skip-camera" class="secondary">Calcula sense càmera</button>
+      </form>
+    </section>
+
+    <section id="step-measure" class="card" hidden>
+      <h2>2 · Mesura del pols</h2>
+      <ol class="muted">
+        <li>Assegut i en repòs 5 min; mà a l'alçada del cor, recolzada.</li>
+        <li>Tapa la càmera posterior i el flaix amb el tou del dit índex, sense prémer fort.</li>
+        <li>No et moguis ni parlis durant 60 s.</li>
+      </ol>
+      <canvas id="wave" width="640" height="160" aria-label="Ona de pols en directe"></canvas>
+      <p id="measure-status" class="status" aria-live="polite">Preparant la càmera…</p>
+      <progress id="measure-progress" max="1" value="0"></progress>
+      <button type="button" id="cancel-measure" class="secondary">Cancel·la</button>
+      <video id="video" playsinline muted hidden></video>
+    </section>
+
+    <section id="step-result" class="card" hidden>
+      <h2>3 · Resultat</h2>
+      <div class="hero">
+        <div class="hero-number" id="result-age">–</div>
+        <div class="hero-label">anys d'edat vascular</div>
+        <div id="result-diff" class="pill">–</div>
+      </div>
+      <dl class="metrics" id="result-metrics"></dl>
+      <h3>Contribució de cada estimador</h3>
+      <table id="result-estimators">
+        <thead><tr><th>Estimador</th><th>Edat</th><th>Pes</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <p id="result-note" class="muted"></p>
+      <button type="button" id="repeat" class="primary">Repeteix la mesura</button>
+      <button type="button" id="edit-data" class="secondary">Canvia les dades</button>
+    </section>
+
+    <section class="card" id="history-card" hidden>
+      <h2>Historial</h2>
+      <p id="history-summary" class="status"></p>
+      <ul id="history-list" class="history"></ul>
+      <button type="button" id="clear-history" class="secondary">Esborra l'historial</button>
+    </section>
+
+    <footer class="muted">
+      Estimació de benestar, no un diagnòstic mèdic. No substitueix la mesura clínica
+      de la velocitat de l'ona de pols. Les dades no surten d'aquest dispositiu.
+    </footer>
+  </main>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
